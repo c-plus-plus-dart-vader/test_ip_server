@@ -1,0 +1,1 @@
+/usr/bin/c++     CMakeFiles/protey_server.dir/main.cpp.o CMakeFiles/protey_server.dir/Server.cpp.o  -o protey_server 

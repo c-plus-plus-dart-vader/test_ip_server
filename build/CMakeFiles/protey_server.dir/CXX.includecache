@@ -1,0 +1,46 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/boldyrev/protey_server/Server.cpp
+iostream
+-
+string
+-
+map
+-
+set
+-
+charconv
+-
+vector
+-
+cstring
+-
+cctype
+-
+sys/socket.h
+-
+netinet/in.h
+-
+unistd.h
+-
+errno.h
+-
+algorithm
+-
+sys/epoll.h
+-
+fcntl.h
+-
+Server.hpp
+/home/boldyrev/protey_server/Server.hpp
+
+/home/boldyrev/protey_server/Server.hpp
+arpa/inet.h
+-
+
