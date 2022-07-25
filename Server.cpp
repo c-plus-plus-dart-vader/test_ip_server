@@ -385,31 +385,6 @@ Server::Res_e Server::Start(uint16_t port)
 					}while(TCP_READ_BUFFER_SIZE == read_num);
 				}
 			}
-			/*else if (EPOLLOUT&events[i].events)
-			{
-				cout<<"EPOLLOUT Event for socket "<<events[i].data.fd<<"\n";
-				if (auto it = tcp_messages.find(events[i].data.fd); it != tcp_messages.end())
-				{
-					if (auto& [start_to_write, msg] = it->second; start_to_write)
-					{
-						auto written_bytes = write(events[i].data.fd, &msg[start_to_write], msg.size() - start_to_write);
-						if (written_bytes > 0)
-						{
-							cout<<"Send "<<written_bytes<<" bytes in response\n";
-							if (written_bytes != msg.size() - start_to_write)
-							{
-								start_to_write += written_bytes;
-							}
-							else
-							{
-								cout<<"Response is sent entirely\n";
-								start_to_write = 0;
-								msg.clear();
-							}
-						}
-					}
-				}
-			}*/
 			else if ((EPOLLRDHUP | EPOLLHUP)&events[i].events)
 			{
 				cout<<"Client disconnected for socket "<<events[i].data.fd<<"\n";
