@@ -43,4 +43,12 @@ Server.hpp
 /home/boldyrev/protey_server/Server.hpp
 arpa/inet.h
 -
+mutex
+-
+
+/home/boldyrev/protey_server/main.cpp
+iostream
+-
+Server.hpp
+/home/boldyrev/protey_server/Server.hpp
 
