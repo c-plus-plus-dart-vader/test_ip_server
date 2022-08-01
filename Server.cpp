@@ -81,6 +81,12 @@ struct udp_message_info
 	}
 };
 
+struct tcp_message_info
+{
+	size_t rsp_start_pos;
+	string msg;
+};
+
 int set_nonblocking(int sockfd)
 {
 	int flags = fcntl(sockfd, F_GETFL, 0);
@@ -325,7 +331,7 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 			
 								memcpy(&wbuff[UDP_PACKET_HEADER_SIZE], &it->msg[i*(it->packet_size - UDP_PACKET_HEADER_SIZE)], payload_len);
 								
-								sendto(m_udp_desc, wbuff, UDP_PACKET_HEADER_SIZE + payload_len, 0, (sockaddr const*)&from, from_len);
+								int written_bytes = sendto(m_udp_desc, wbuff, UDP_PACKET_HEADER_SIZE + payload_len, 0, (sockaddr const*)&from, from_len);
 							}
 							cout<<"Response is entirely sent\n";
 							udp_messages.erase(it);
@@ -340,35 +346,40 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 					auto [it, is_new] = tcp_messages.try_emplace(events[i].data.fd);
 					auto& msg = it->second;
 					
-					int read_num;
+					int read_bytes;
+					size_t read_counter = 0;
 					do
 					{
-						read_num = read(events[i].data.fd, buffer, TCP_READ_BUFFER_SIZE);
-						cout<<"Read "<<read_num<<" bytes\n";
+						read_bytes = read(events[i].data.fd, buffer, TCP_READ_BUFFER_SIZE);
 						
-						if (read_num == -1)
+						if (read_bytes == -1)
 						{
-							if (errno == EINTR)
+							if (errno == EINTR) {
 								cout<<"EINTR\n";
 								continue;
-							if (errno == EAGAIN)
-								cout<<"EAGAIN. Wait END symbol('\n') message later\n";
+							}
+							if (errno == EAGAIN || errno == EWOULDBLOCK) {
+								cout<<"EAGAIN or EWOULDBLOCK. Wait END symbol('\n') message later\n";
 								break;
+							}
 							
 							cout<<"Read finished with ERROR: "<<strerror(errno)<<"\n";
 							msg.clear();
 							break;
 						}
-						else if (read_num == 0)
+						else if ((read_bytes == 0) and (0 == read_counter))
 						{
 							cout<<"Client disconnected for socket "<<events[i].data.fd<<"\n";
 							tcp_messages.erase(events[i].data.fd);
 							close(events[i].data.fd);							
 						}
-						else if (read_num > 0)
+						else
 						{
-							msg.append(buffer, read_num);
-							//cout<<"Message buffer:"<<msg.c_str();
+							cout<<"Read "<<read_bytes<<" bytes\n";
+							
+							msg.append(buffer, read_bytes);
+							++read_counter;
+							
 							if (msg.back() == '\n')
 							{
 								cout<<"Message END symbol is detected\n";
@@ -379,15 +390,17 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 								msg.push_back('\n');
 								
 								size_t start_pos = 0;
+								size_t len_to_send = msg.size();
 								while(1)
 								{
-									int written_bytes = write(events[i].data.fd, msg.data() + start_pos, msg.size() - start_pos);
+									int written_bytes = send(events[i].data.fd, msg.data() + start_pos, len_to_send, 0);
 									if (written_bytes >= 0)
 									{
 										cout<<"Send "<<written_bytes<<" bytes in response\n";
-										if (written_bytes != msg.size() - start_pos)
+										if (start_pos != msg.size())
 										{
 											start_pos += written_bytes;
+											len_to_send = msg.size() - start_pos;
 										}
 										else
 										{
@@ -396,17 +409,36 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 											break;
 										}
 									}
-									else
+									else//-1 case
 									{
-										cout<<"Write failed: "<<strerror(errno)<<"\n";;
-										msg.clear();
+										cout<<"Write failed: "<<strerror(errno)<<"\n";
+										
+										if (EAGAIN == errno || EWOULDBLOCK == errno)
+										{
+											len_to_send = len_to_send/2;
+											continue;
+										}	
+										else if (EINTR  == errno)
+										{
+											continue;
+										}
+										else if (ECONNRESET == errno)
+										{
+											cout<<"Client disconnected for socket "<<events[i].data.fd<<"\n";
+											close(events[i].data.fd);
+										}
+										else
+										{
+											msg.clear();
+										}
 										break;
 									}
 								}
+								break;
 							}
 							else cout<<"\n";
 						}
-					}while(TCP_READ_BUFFER_SIZE == read_num);
+					}while(TCP_READ_BUFFER_SIZE == read_bytes);
 				}
 			}
 			else if ((EPOLLRDHUP | EPOLLHUP)&events[i].events)
