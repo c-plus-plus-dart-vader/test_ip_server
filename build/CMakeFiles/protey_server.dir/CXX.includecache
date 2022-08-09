@@ -6,7 +6,7 @@
 
 #IncludeRegexTransform: 
 
-../../protey_common/Logger.hpp
+../../common/Logger.hpp
 iostream
 -
 string
