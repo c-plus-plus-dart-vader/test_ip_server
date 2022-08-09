@@ -2,6 +2,7 @@
 #include <string>
 #include <map>
 #include <set>
+#include <list>
 #include <charconv>
 #include <vector>
 #include <cstring>
@@ -14,20 +15,27 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 #include "Server.hpp"
+#include "Logger.hpp"
 
 using namespace std;
 
+template<class ... Args>
+void Log(Args ... args)
+{
+	utils::Log("Server.cpp: ", args...);
+}
+
 constexpr string_view UDP_PACKET_BEGIN {"proteyclient"};
 
-constexpr uint16_t TCP_READ_BUFFER_SIZE   = 25;
+constexpr size_t TCP_READ_BUFFER_SIZE     = 20;
 constexpr uint8_t  MAX_IPv4_SIZE          = 15;
 constexpr uint16_t MAX_UDP_PACKET_SIZE    = 512;
-constexpr uint8_t  UDP_PH_QTY_POS         = UDP_PACKET_BEGIN.size();
-constexpr uint8_t  UDP_PH_SEQ_NUM_POS     = UDP_PH_QTY_POS + 2;
-constexpr uint8_t  UDP_PH_SIZE_POS        = UDP_PH_SEQ_NUM_POS + 2;
-constexpr uint8_t  UDP_PACKET_HEADER_SIZE = UDP_PH_SIZE_POS + 2;
+constexpr uint16_t UDP_PH_QTY_POS         = UDP_PACKET_BEGIN.size();
+constexpr uint16_t UDP_PH_SEQ_NUM_POS     = UDP_PH_QTY_POS + 2;
+constexpr uint16_t UDP_PH_SIZE_POS        = UDP_PH_SEQ_NUM_POS + 2;
+constexpr uint16_t UDP_PACKET_HEADER_SIZE = UDP_PH_SIZE_POS + 2;
 
-void input_handling(string& in, bool IsTcp)
+void input_handler(string& in, bool IsTcp)
 {
 	vector<size_t> numbers;
 	auto end_it = end(in);
@@ -66,12 +74,13 @@ void input_handling(string& in, bool IsTcp)
 
 struct udp_message_info
 {
-	char ip[MAX_IPv4_SIZE + 1] = {'\0'};
-	uint16_t port;
-	mutable uint16_t packets_qty;
-	mutable uint16_t packet_size;
-	mutable vector<uint16_t> packet_sn_list;
-	mutable string msg;
+	char                   ip[MAX_IPv4_SIZE + 1] = {'\0'};
+	uint16_t               port;
+	uint16_t               packet_size;
+	mutable uint16_t       packets_qty;
+	mutable list<uint16_t> packet_sn_list;
+	mutable string         msg;
+	mutable bool           is_rsp_in_progress;
 	
 	bool operator<(udp_message_info const& other) const
 	{
@@ -98,10 +107,111 @@ int set_nonblocking(int sockfd)
 	}
 	return 0;
 }
+
+using tcp_msg_storage_t = map<int, tcp_message_info>;
+
+bool tcp_write_handler(int& tcp_desc, tcp_message_info& msg_info, tcp_msg_storage_t& storage, size_t start_pos)
+{
+	while(1)
+	{
+		int written_bytes = send(tcp_desc, msg_info.msg.data() + start_pos, msg_info.msg.size() - start_pos, 0);
+		if (written_bytes >= 0)
+		{
+			Log("Send ", written_bytes, " bytes in response");
+			start_pos += written_bytes;
+			if (start_pos == msg_info.msg.size()) {
+				msg_info.msg.clear();
+				msg_info.rsp_start_pos = 0;
+				Log("Response is entirely sent by TCP socket ", tcp_desc);
+				return true;
+			}
+		}
+		else//-1 case
+		{
+			if (EAGAIN == errno || EWOULDBLOCK == errno) {
+				Log("EAGAIN or EWOULDBLOCK while writing to TCP socket ", tcp_desc); 
+				msg_info.rsp_start_pos = start_pos;
+				return true;
+			}	
+			if (EINTR  == errno) {
+				Log("EINTR");
+				continue;
+			}
+			if (ECONNRESET == errno) {
+				Log("TCP client disconnected for socket ", tcp_desc);
+				storage.erase(tcp_desc);
+				close(tcp_desc);
+				tcp_desc = -1;
+				return false;
+			}
+			Log("Write failed: ", strerror(errno));
+			msg_info.msg.clear();
+			msg_info.rsp_start_pos = 0;
+			return false;
+		}
+	}	
+}
+
+using udp_storage_t = set<udp_message_info>;
+
+//return is_rsp_in_progress
+bool udp_write_handler(
+int udp_desc, 
+udp_message_info const& msg_info,
+uint16_t ost,
+sockaddr_in const& from,
+socklen_t const& from_len)
+{
+	for (auto packet_it = msg_info.packet_sn_list.begin(); packet_it != msg_info.packet_sn_list.end(); )
+	{
+		char wbuff[MAX_UDP_PACKET_SIZE];
+		memcpy(wbuff, UDP_PACKET_BEGIN.data(), UDP_PACKET_BEGIN.size());
+		uint16_t packets_qty_net = htons(msg_info.packets_qty);
+		memcpy(wbuff + UDP_PH_QTY_POS, &packets_qty_net, sizeof(packets_qty_net));
+		uint16_t seq_num_net = htons(*packet_it);
+		memcpy(wbuff + UDP_PH_SEQ_NUM_POS, &seq_num_net, sizeof(seq_num_net));
+		uint16_t ps_net = htons(msg_info.packet_size);
+		memcpy(wbuff + UDP_PH_SIZE_POS, &ps_net, sizeof(ps_net));
+		
+		size_t payload_len;
+		if ((msg_info.packets_qty - 1) == (*packet_it) and ost > 0) payload_len = ost;
+		else payload_len = msg_info.packet_size - UDP_PACKET_HEADER_SIZE;
+
+		memcpy(&wbuff[UDP_PACKET_HEADER_SIZE], &msg_info.msg[(*packet_it)*(msg_info.packet_size - UDP_PACKET_HEADER_SIZE)], payload_len);
+		
+		int written_bytes = sendto(udp_desc, wbuff, UDP_PACKET_HEADER_SIZE + payload_len, 0, (sockaddr const*)&from, from_len);
+		if (written_bytes > 0)
+		{
+			Log("Packet ", *packet_it, " of response for client ", msg_info.ip, ":", msg_info.port, " is sent");
+			packet_it = msg_info.packet_sn_list.erase(packet_it);
+		}
+		else
+		{
+			if (0 == written_bytes || errno == EAGAIN || errno == EWOULDBLOCK) {
+				Log("EAGAIN or EWOULDBLOCK or no bytes are sent while responding by UDP");
+				if (not msg_info.is_rsp_in_progress) {
+					msg_info.is_rsp_in_progress = true;
+				}
+				return true;
+			}
+			else if (errno == EINTR) {
+				Log("EINTR while responding");
+				continue;
+			}
+			else {
+				Log("Response sending failed");
+				return false;
+			}
+		}
+	}
+	
+	Log("Response for client ", msg_info.ip, ":", msg_info.port, " is entirely sent");
+	return true;
+}
 	
 Server::~Server()
 {
-	cout<<"Server DTOR\n";
+	Log("Server DTOR");
 	if (-1 != m_tcp_desc) close(m_tcp_desc);
 	if (-1 != m_udp_desc) close(m_udp_desc);
 }
@@ -118,30 +228,30 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 	m_tcp_desc = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (-1 == m_tcp_desc)
 	{
-		cout<<"Creation of an unbound TCP socket and get file descriptor failed: "<<strerror(errno)<<"\n";
+		Log("Creation of an unbound TCP socket and get file descriptor failed: ", strerror(errno));
 		if ((errno == ENFILE)or(errno == EMFILE)or(errno == ENOBUFS)or(errno == ENOMEM))
 		{
-			cout<<"You can try later\n";
+			Log("You can try later");
 			return Res_e::TEMPORARY_UNSUFFICIENT_RESOURCES;
 		}
 		return Res_e::FAILURE;
 	}
-	cout<<"TCP unbound socket "<<m_tcp_desc<<" is created\n";
+	Log("TCP unbound socket ", m_tcp_desc, " is created");
 	
 	m_udp_desc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (-1 == m_udp_desc)
 	{
-		cout<<"Creation of an unbound UDP socket and get file descriptor failed: "<<strerror(errno)<<"\n";
+		Log("Creation of an unbound UDP socket and get file descriptor failed: ", strerror(errno));
 		close(m_tcp_desc);
 		m_tcp_desc = -1;
 		if ((errno == ENFILE)or(errno == EMFILE)or(errno == ENOBUFS)or(errno == ENOMEM))
 		{
-			cout<<"You can try later\n";
+			Log("You can try later");
 			return Res_e::TEMPORARY_UNSUFFICIENT_RESOURCES;
 		}
 		return Res_e::FAILURE;
 	}
-	cout<<"UDP unbound socket "<<m_udp_desc<<" is created\n";
+	Log("UDP unbound socket ", m_udp_desc, " is created");
 	
 	memset(&m_server_sa, 0, sizeof(m_server_sa));
 	m_server_sa.sin_family = AF_INET;
@@ -158,6 +268,8 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 		return Res_e::FAILURE;
 	}
 	
+	Log("UDP and TCP sockets are bound");
+	
 	if (-1 == listen(m_tcp_desc, 5))
 	{
 		close(m_tcp_desc);
@@ -170,6 +282,10 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 	auto const epfd = epoll_create(10);
 	if (-1 == epfd)
 	{
+		close(m_tcp_desc);
+		m_tcp_desc = -1;
+		close(m_udp_desc);
+		m_udp_desc = -1;
 		return Res_e::FAILURE;
 	}	
 	
@@ -178,38 +294,57 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 	tcp_ev.data.fd = m_tcp_desc;
 	if (-1 == epoll_ctl(epfd, EPOLL_CTL_ADD, m_tcp_desc, &tcp_ev))
 	{
+		close(m_tcp_desc);
+		m_tcp_desc = -1;
+		close(m_udp_desc);
+		m_udp_desc = -1;
 		return Res_e::FAILURE;
+	}
+	
+	if (-1 == set_nonblocking(m_udp_desc))
+	{
+		Log("Set NON BLOCKING mode for UDP socket ", m_udp_desc, " failed: ", strerror(errno));
+		close(m_tcp_desc);
+		m_tcp_desc = -1;
+		close(m_udp_desc);
+		m_udp_desc = -1;
+		return Res_e::FAILURE;	
 	}
 	
 	epoll_event udp_ev;
-	udp_ev.events = EPOLLIN;
+	udp_ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
 	udp_ev.data.fd = m_udp_desc;
 	if (-1 == epoll_ctl(epfd, EPOLL_CTL_ADD, m_udp_desc, &udp_ev))
 	{
+		close(m_tcp_desc);
+		m_tcp_desc = -1;
+		close(m_udp_desc);
+		m_udp_desc = -1;
 		return Res_e::FAILURE;
 	}
 	//first field in pair is position in message for write next part of message
-	map<int, string> tcp_messages;
-	set<udp_message_info> udp_messages;
+	tcp_msg_storage_t tcp_messages;
+	udp_storage_t udp_messages;
 	
-	constexpr size_t MAX_EVENTS = 10;
+	constexpr size_t MAX_EVENTS = 15;
 	epoll_event events[MAX_EVENTS];
-	epoll_event event_connected_sd;
+	
 	for(;;)
 	{
 		int const nfds = epoll_wait(epfd, events, MAX_EVENTS, ms_timeout);
 		if (-1 == nfds)
 		{
-			cout<<"epoll_wait failed: "<<strerror(errno)<<"\n";
+			Log("epoll_wait failed: ", strerror(errno));
 			return Res_e::FAILURE;	
 		}
 		if (0 == nfds)
 		{
-			cout<<"epoll_wait timeout\n";
+			Log("epoll_wait timeout");
 			break;
 		}
 		else
 		{
+			Log("epoll_wait return ", nfds); 
 			m_mtx.lock();
 			if (m_stop)
 			{
@@ -222,9 +357,43 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 		
 		for (int i = 0; i < nfds; ++i)
 		{
+			if (EPOLLOUT&events[i].events)
+			{
+				Log("EPOLLOUT Event for ", (events[i].data.fd != m_udp_desc ? "TCP" : "UDP"), " socket ", events[i].data.fd);
+				if (events[i].data.fd != m_udp_desc)
+				{
+					if (auto it = tcp_messages.find(events[i].data.fd); tcp_messages.cend() != it) {
+						int sd = events[i].data.fd;
+						tcp_write_handler(sd, it->second, tcp_messages, it->second.rsp_start_pos);
+					}
+				}
+				else
+				{
+					for (auto it = udp_messages.begin(); it != udp_messages.end(); )
+					{
+						if (it->is_rsp_in_progress)
+						{
+							Log("UDP socket ", events[i].data.fd, " is going to continue sending response for ", it->ip, ":", it->port); 
+							sockaddr_in from;
+							socklen_t from_len = sizeof(from);
+							memset(&from, 0, from_len);
+							inet_pton(AF_INET, it->ip, &from.sin_addr);
+							from.sin_port = htons(it->port);
+							from.sin_family = AF_INET;
+							
+							uint16_t ost = it->msg.size()%(it->packet_size - UDP_PACKET_HEADER_SIZE);
+							if (not udp_write_handler(m_udp_desc, *it, ost, from, from_len) or it->packet_sn_list.empty()) {
+								it = udp_messages.erase(it);
+							}
+							else ++it;
+						}
+						else ++it;
+					}
+				}
+			}
 			if (EPOLLIN&events[i].events)
 			{
-				cout<<"EPOLLIN Event for "<<(events[i].data.fd != m_udp_desc ? "TCP" : "UDP")<<" socket "<<events[i].data.fd<<"\n";
+				Log("EPOLLIN Event for ", (events[i].data.fd != m_udp_desc ? "TCP" : "UDP"), " socket ", events[i].data.fd);
 				if (events[i].data.fd == m_tcp_desc)
 				{
 					sockaddr_in from;
@@ -233,217 +402,239 @@ Server::Res_e Server::Start(uint16_t port, int ms_timeout)
 					int conn_desc = accept(m_tcp_desc, (sockaddr*)&from, &from_len);
 					if (-1 == conn_desc)
 					{
-						cout<<"accept failed: "<<strerror(errno)<<"\n";
-						return Res_e::FAILURE;	
+						Log("accept failed: ", strerror(errno));
+						continue;	
 					}
 					char from_ip[MAX_IPv4_SIZE + 1];
 					inet_ntop(AF_INET, &from.sin_addr, from_ip, sizeof(from_ip));
 					auto const from_port = ntohs(from.sin_port);
-					cout<<"TCP connection socket "<<conn_desc<<" is created for TCP client "<<from_ip<<":"<<from_port<<"\n";
+					Log("TCP connection socket ", conn_desc, " is created for TCP client ", from_ip, ":", from_port);
 					if (-1 == set_nonblocking(conn_desc))
 					{
-						cout<<"Set NON BLOCKING mode for socket "<<conn_desc<<" failed: "<<strerror(errno)<<"\n";
+						Log("Set NON BLOCKING mode for socket ", conn_desc, " failed: ", strerror(errno));
 						close(conn_desc);
-						return Res_e::FAILURE;	
+						continue;	
 					}
+					epoll_event event_connected_sd;
 					event_connected_sd.data.fd = conn_desc;
 					event_connected_sd.events = EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP | EPOLLET;
 					if (-1 == epoll_ctl(epfd, EPOLL_CTL_ADD, conn_desc, &event_connected_sd))
 					{
-						cout<<"epoll_ctl for socket "<<conn_desc<<" failed: "<<strerror(errno)<<"\n";
+						Log("epoll_ctl for socket ", conn_desc, " failed: ", strerror(errno));
 						close(conn_desc);
-						return Res_e::FAILURE;	
+						continue;	
 					}
 				}
 				else if (events[i].data.fd == m_udp_desc)
 				{
 					char buffer[MAX_UDP_PACKET_SIZE];
-					sockaddr_in from;
-					socklen_t from_len = sizeof(from);
-					size_t read_num = recvfrom(m_udp_desc, buffer, MAX_UDP_PACKET_SIZE, 0, (sockaddr*)&from, &from_len);
-					if (read_num > 0)
+					while(1)
 					{
-						if (read_num < (UDP_PACKET_HEADER_SIZE + 1))
+						sockaddr_in from;
+						socklen_t from_len = sizeof(from);
+						int read_num = recvfrom(m_udp_desc, buffer, MAX_UDP_PACKET_SIZE, 0, (sockaddr*)&from, &from_len);
+						if (read_num > 0)
 						{
-							cout<<"Packet is not from protey client\n";
-							continue;
-						}
-						if (string_view{buffer, UDP_PACKET_BEGIN.size()} != UDP_PACKET_BEGIN)
-						{
-							cout<<"Packet is not from protey client\n";
-							continue;
-						}
-						udp_message_info mi;
-						inet_ntop(AF_INET, &from.sin_addr, mi.ip, sizeof(mi.ip));
-						mi.port = ntohs(from.sin_port);
-						cout<<"Packet received from client "<<mi.ip<<":"<<mi.port<<"\n";
-						auto [it, res] = udp_messages.emplace(mi);
-						if (res)
-						{
-							it->packets_qty = ((uint16_t)buffer[UDP_PH_QTY_POS]<<8)|(uint16_t)buffer[UDP_PH_QTY_POS + 1];
-							cout<<"Packet qty is "<<it->packets_qty<<"\n";
-							it->packet_size = ((uint16_t)buffer[UDP_PH_SIZE_POS]<<8)|(uint16_t)buffer[UDP_PH_SIZE_POS + 1];
-							cout<<"Packet size is "<<it->packet_size<<"\n";
-							it->msg.resize(it->packets_qty * (it->packet_size - UDP_PACKET_HEADER_SIZE));
-						}
-						uint16_t packet_number = ((uint16_t)buffer[UDP_PH_SEQ_NUM_POS]<<8)|(uint16_t)buffer[UDP_PH_SEQ_NUM_POS + 1];
-						cout<<"Packet number is "<<packet_number<<"\n";
-
-						if (find(it->packet_sn_list.begin(), it->packet_sn_list.end(), packet_number) != it->packet_sn_list.end())
-						{
-							cout<<"Duplicated packet\n";
-							continue;
-						}
-						it->packet_sn_list.push_back(packet_number);
-						if (packet_number == (it->packets_qty - 1))
-						{
-							cout<<"Last packet of message is received\n";
-							it->msg.resize((it->packets_qty - 1)*(it->packet_size - UDP_PACKET_HEADER_SIZE) + read_num - UDP_PACKET_HEADER_SIZE);
-						}
-						
-						memcpy(&it->msg[packet_number*(it->packet_size - UDP_PACKET_HEADER_SIZE)], &buffer[UDP_PACKET_HEADER_SIZE], read_num - UDP_PACKET_HEADER_SIZE);
-						
-						if (it->packets_qty == it->packet_sn_list.size())
-						{
-							cout<<"All packets of message are received\n";
-							input_handling(it->msg, false);
-							uint16_t packet_qty = it->msg.size()/(it->packet_size - UDP_PACKET_HEADER_SIZE);
-							uint16_t ost = it->msg.size()%(it->packet_size - UDP_PACKET_HEADER_SIZE);
-							if (ost > 0){ ++packet_qty; }
-							cout<<"PACKETS_QTY for response is "<<packet_qty<<"\n";
-							
-							for (size_t i = 0; i < packet_qty; ++i)
+							if (read_num < (UDP_PACKET_HEADER_SIZE))
 							{
-								char wbuff[it->packet_size];
-								memcpy(wbuff, UDP_PACKET_BEGIN.data(), UDP_PACKET_BEGIN.size());
-								wbuff[UDP_PH_QTY_POS] = (packet_qty&0xff00)>>8;
-								wbuff[UDP_PH_QTY_POS + 1] = packet_qty&0xff;
-								
-								wbuff[UDP_PH_SEQ_NUM_POS] = (i&0xff00)>>8;
-								wbuff[UDP_PH_SEQ_NUM_POS + 1] = i&0xff;
-								
-								wbuff[UDP_PH_SIZE_POS] = (it->packet_size&0xff00)>>8;
-								wbuff[UDP_PH_SIZE_POS + 1] = it->packet_size&0xff;
-								
-								size_t payload_len;
-								if ((packet_qty - 1) == i and ost > 0) payload_len = ost;
-								else payload_len = it->packet_size - UDP_PACKET_HEADER_SIZE;
-			
-								memcpy(&wbuff[UDP_PACKET_HEADER_SIZE], &it->msg[i*(it->packet_size - UDP_PACKET_HEADER_SIZE)], payload_len);
-								
-								int written_bytes = sendto(m_udp_desc, wbuff, UDP_PACKET_HEADER_SIZE + payload_len, 0, (sockaddr const*)&from, from_len);
+								Log("Packet is not from protey client");
+								continue;
 							}
-							cout<<"Response is entirely sent\n";
-							udp_messages.erase(it);
-						}
-					}	
+							if (string_view{buffer, UDP_PACKET_BEGIN.size()} != UDP_PACKET_BEGIN)
+							{
+								Log("Packet is not from protey client");
+								continue;
+							}
+							
+							uint16_t packet_size;
+							memcpy(&packet_size, buffer + UDP_PH_SIZE_POS, sizeof(packet_size));
+							packet_size = ntohs(packet_size);
+							if (packet_size > MAX_UDP_PACKET_SIZE) {
+								Log("Packet size ", packet_size, " bytes is too large");
+								continue;
+							}
+							
+							udp_message_info mi;
+							inet_ntop(AF_INET, &from.sin_addr, mi.ip, sizeof(mi.ip));
+							mi.port = ntohs(from.sin_port);
+							mi.packet_size = packet_size;
+							Log("Packet received from client ", mi.ip, ":", mi.port);
+							auto [it, res] = udp_messages.emplace(mi);
+							if (res)
+							{	
+								Log("Packet size is ", it->packet_size);
+								memcpy(&it->packets_qty, buffer + UDP_PH_QTY_POS, sizeof(it->packets_qty));
+								it->packets_qty = ntohs(it->packets_qty);
+								Log("Packet qty is ", it->packets_qty);
+								it->msg.resize(it->packets_qty * (it->packet_size - UDP_PACKET_HEADER_SIZE));
+								it->is_rsp_in_progress = false;
+							}
+							else
+							{
+								if (it->is_rsp_in_progress)
+								{
+									Log("Duplicated packet is received after sending response starts");
+									continue;
+								}
+							}
+							uint16_t packet_number;
+							memcpy(&packet_number, buffer + UDP_PH_SEQ_NUM_POS, sizeof(packet_number));
+							packet_number = ntohs(packet_number);
+							Log("Packet number is ", packet_number);
 
+							if (find(it->packet_sn_list.begin(), it->packet_sn_list.end(), packet_number) != it->packet_sn_list.end())
+							{
+								Log("Duplicated packet");
+								continue;
+							}
+							it->packet_sn_list.push_back(packet_number);
+							if (packet_number == (it->packets_qty - 1))
+							{
+								Log("Last packet of message is received");
+								it->msg.resize((it->packets_qty - 1)*(it->packet_size - UDP_PACKET_HEADER_SIZE) + (read_num - UDP_PACKET_HEADER_SIZE));
+							}
+							else
+							{
+								if (read_num != it->packet_size)
+								{
+									Log("Damaged packet");
+									continue;
+								}
+							}
+							
+							memcpy(&it->msg[packet_number*(it->packet_size - UDP_PACKET_HEADER_SIZE)], &buffer[UDP_PACKET_HEADER_SIZE], read_num - UDP_PACKET_HEADER_SIZE);
+							
+							if (it->packets_qty == it->packet_sn_list.size())
+							{
+								Log("All packets of message are received");
+								input_handler(it->msg, false);
+								it->packets_qty = it->msg.size()/(it->packet_size - UDP_PACKET_HEADER_SIZE);
+								uint16_t ost = it->msg.size()%(it->packet_size - UDP_PACKET_HEADER_SIZE);
+								if (ost > 0){ ++(it->packets_qty); }
+								Log("Packets qty for response is ", it->packets_qty);
+								
+								
+								it->packet_sn_list.clear();
+								for (size_t i = 0; i < it->packets_qty; ++i){ it->packet_sn_list.push_back(i); }
+								
+								if (not udp_write_handler(m_udp_desc, *it, ost, from, from_len) or it->packet_sn_list.empty())
+								{
+									udp_messages.erase(it);
+								}
+							}
+						}
+						else if (0 == read_num)
+						{
+							Log("Read 0 bytes");
+							break;
+						}
+						else
+						{
+							if (errno == EAGAIN || errno == EWOULDBLOCK) {
+								Log("EAGAIN or EWOULDBLOCK while reading from UDP socket ", m_udp_desc);
+							}
+							else {
+								Log("Read failed: ", strerror(errno));
+							}
+							break;
+						}
+					}
 				}	
 				else
 				{
 					char buffer[TCP_READ_BUFFER_SIZE];
 					
 					auto [it, is_new] = tcp_messages.try_emplace(events[i].data.fd);
-					auto& msg = it->second;
+					if (is_new)
+					{
+						it->second.rsp_start_pos = 0;
+					}
+					else if (0 != it->second.rsp_start_pos)
+					{
+						Log("Cached response message can not be modified by input request");
+						continue;
+					}
+					auto& msg = it->second.msg;
 					
 					int read_bytes;
 					size_t read_counter = 0;
-					do
+					while(1)
 					{
 						read_bytes = read(events[i].data.fd, buffer, TCP_READ_BUFFER_SIZE);
 						
 						if (read_bytes == -1)
 						{
 							if (errno == EINTR) {
-								cout<<"EINTR\n";
+								Log("EINTR");
 								continue;
 							}
 							if (errno == EAGAIN || errno == EWOULDBLOCK) {
-								cout<<"EAGAIN or EWOULDBLOCK. Wait END symbol('\n') message later\n";
+								Log("EAGAIN or EWOULDBLOCK while reading from TCP socket ", events[i].data.fd);
 								break;
 							}
 							
-							cout<<"Read finished with ERROR: "<<strerror(errno)<<"\n";
+							Log("Read finished with ERROR: ", strerror(errno));
 							msg.clear();
 							break;
 						}
 						else if ((read_bytes == 0) and (0 == read_counter))
 						{
-							cout<<"Client disconnected for socket "<<events[i].data.fd<<"\n";
-							tcp_messages.erase(events[i].data.fd);
-							close(events[i].data.fd);							
+							Log("Client disconnected for socket ", events[i].data.fd);
+							tcp_messages.erase(it);
+							close(events[i].data.fd);
+							break;
 						}
 						else
 						{
-							cout<<"Read "<<read_bytes<<" bytes\n";
-							
-							msg.append(buffer, read_bytes);
+							Log("Read ", read_bytes, " bytes by TCP");
 							++read_counter;
 							
-							if (msg.back() == '\n')
+							if (it->second.rsp_start_pos){
+								Log("Socket ", events[i].data.fd, " is busy by sending response to previous message. This request will be damaged or lost");
+								continue;
+							}
+							
+							int sd = events[i].data.fd;
+							auto end = buffer + read_bytes;
+							for (auto curr = buffer; curr != end; )
 							{
-								cout<<"Message END symbol is detected\n";
-								//actions with back() symbol because input_handling function is used both TCP and UDP
-								//And '\n' symbol is used as message end only in TCP
-								msg.pop_back();
-								input_handling(msg, true);
-								msg.push_back('\n');
-								
-								size_t start_pos = 0;
-								size_t len_to_send = msg.size();
-								while(1)
+								auto msg_end = find(curr, end, '\n');
+								msg.append(curr, msg_end);
+							
+								if (msg_end != end)
 								{
-									int written_bytes = send(events[i].data.fd, msg.data() + start_pos, len_to_send, 0);
-									if (written_bytes >= 0)
-									{
-										cout<<"Send "<<written_bytes<<" bytes in response\n";
-										if (start_pos != msg.size())
-										{
-											start_pos += written_bytes;
-											len_to_send = msg.size() - start_pos;
+									Log("Message END symbol is detected");
+									
+									input_handler(msg, true);
+									//Actions with back() symbol because input_handling function is used both TCP and UDP
+									//And '\n' symbol is used as message end only in TCP
+									msg.push_back('\n');
+									
+									size_t start_pos = 0;
+									
+									if (tcp_write_handler(sd, it->second, tcp_messages, start_pos)){
+										if (0 != it->second.rsp_start_pos){
+											curr = ++msg_end;
 										}
-										else
-										{
-											msg.clear();
-											cout<<"Response is sent entirely\n";
-											break;
-										}
+										else break;
 									}
-									else//-1 case
-									{
-										cout<<"Write failed: "<<strerror(errno)<<"\n";
-										
-										if (EAGAIN == errno || EWOULDBLOCK == errno)
-										{
-											len_to_send = len_to_send/2;
-											continue;
-										}	
-										else if (EINTR  == errno)
-										{
-											continue;
+									else{
+										if (-1 != sd){
+											curr = ++msg_end;
 										}
-										else if (ECONNRESET == errno)
-										{
-											cout<<"Client disconnected for socket "<<events[i].data.fd<<"\n";
-											close(events[i].data.fd);
-										}
-										else
-										{
-											msg.clear();
-										}
-										break;
+										else break;
 									}
 								}
-								break;
+								else break;	
 							}
-							else cout<<"\n";
+							if (-1 == sd) break;
 						}
-					}while(TCP_READ_BUFFER_SIZE == read_bytes);
+					}
 				}
 			}
-			else if ((EPOLLRDHUP | EPOLLHUP)&events[i].events)
+			if ((EPOLLRDHUP | EPOLLHUP)&events[i].events)
 			{
-				cout<<"Client disconnected for socket "<<events[i].data.fd<<"\n";
+				Log("EPOLLRDHUP or EPOLLHUP, client is disconnected for socket ", events[i].data.fd);
 				tcp_messages.erase(events[i].data.fd);
 				close(events[i].data.fd);
 			}

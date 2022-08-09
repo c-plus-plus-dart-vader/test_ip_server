@@ -4,6 +4,8 @@ project(protey_server)
 
 set(CMAKE_CXX_STANDARD 17)
 
-add_executable(${PROJECT_NAME} main.cpp Server.cpp)
+include_directories(
+${CMAKE_CURRENT_SOURCE_DIR}/../protey_common
+)
 
-target_link_libraries(${PROJECT_NAME})
+add_executable(${PROJECT_NAME} main.cpp Server.cpp)

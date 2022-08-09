@@ -6,6 +6,14 @@
 
 #IncludeRegexTransform: 
 
+../../protey_common/Logger.hpp
+iostream
+-
+string
+-
+type_traits
+-
+
 /home/boldyrev/protey_server/Server.cpp
 iostream
 -
@@ -14,6 +22,8 @@ string
 map
 -
 set
+-
+list
 -
 charconv
 -
@@ -39,16 +49,12 @@ fcntl.h
 -
 Server.hpp
 /home/boldyrev/protey_server/Server.hpp
+Logger.hpp
+/home/boldyrev/protey_server/Logger.hpp
 
 /home/boldyrev/protey_server/Server.hpp
 arpa/inet.h
 -
 mutex
 -
-
-/home/boldyrev/protey_server/main.cpp
-iostream
--
-Server.hpp
-/home/boldyrev/protey_server/Server.hpp
 
